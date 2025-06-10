@@ -1,0 +1,11 @@
+services:
+  - type: web
+    name: my-utube-cute
+    env: python
+    buildCommand: "pip install -r requirements.txt"
+    startCommand: "gunicorn app:app"
+    envVars:
+      - key: API_SECRET_KEY
+        sync: false
+    buildpacks:
+      - url: https://github.com/jonathanong/heroku-buildpack-ffmpeg-latest
