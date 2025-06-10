@@ -1,6 +1,7 @@
 from flask import Flask, request, send_file, jsonify
 from flask_cors import CORS
 from pytube import YouTube
+from pytube.exceptions import PytubeError
 from moviepy.editor import AudioFileClip
 import os
 import io
@@ -8,17 +9,12 @@ import io
 app = Flask(__name__)
 CORS(app) 
 
-# Load the secret key from the environment variables set on Render
-# This is safe because the key is NOT written in the code
 API_KEY = os.environ.get('API_SECRET_KEY')
 
 @app.route('/convert', methods=['POST'])
 def convert_video():
-    # --- SECURITY CHECK ---
-    # Check if the request includes the correct API key in its headers
     request_api_key = request.headers.get('X-API-Key')
     if not API_KEY or request_api_key != API_KEY:
-        # If the key is missing or wrong, deny access
         return jsonify({"error": "Unauthorized Access"}), 401
 
     data = request.get_json()
@@ -29,10 +25,23 @@ def convert_video():
 
     try:
         yt = YouTube(url)
-        video_stream = yt.streams.filter(only_audio=True).first()
+
+        # --- IMPROVED STREAM SELECTION ---
+        # First, try to get a specific audio-only stream which is often more reliable
+        video_stream = yt.streams.get_audio_only()
+        
+        # If the preferred stream isn't found, fall back to the old method
+        if video_stream is None:
+            video_stream = yt.streams.filter(only_audio=True).first()
+
+        # If there's still no stream, the video is likely unavailable
+        if video_stream is None:
+            raise PytubeError("No suitable audio stream found for this video.")
+
         buffer = io.BytesIO()
         video_stream.stream_to_buffer(buffer)
         buffer.seek(0)
+        
         temp_input_filename = "temp_audio_input"
         with open(temp_input_filename, "wb") as f:
             f.write(buffer.read())
@@ -53,6 +62,11 @@ def convert_video():
             download_name=mp3_filename,
             mimetype='audio/mpeg'
         )
+    
+    # --- IMPROVED ERROR HANDLING ---
+    except PytubeError as e:
+        print(f"Pytube error for URL {url}: {str(e)}")
+        return jsonify({"error": f"Video unavailable: It might be private, age-restricted, or removed."}), 500
     except Exception as e:
-        print(f"Error: {e}")
-        return jsonify({"error": f"An error occurred during conversion: {str(e)}"}), 500
+        print(f"Generic error for URL {url}: {str(e)}")
+        return jsonify({"error": f"An unexpected error occurred during conversion."}), 500
