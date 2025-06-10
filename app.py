@@ -1,15 +1,18 @@
 from flask import Flask, request, send_file, jsonify
 from flask_cors import CORS
-from pytube import YouTube
-from pytube.exceptions import PytubeError
-from moviepy.editor import AudioFileClip
+import yt_dlp
 import os
-import io
+import re
 
 app = Flask(__name__)
 CORS(app) 
 
 API_KEY = os.environ.get('API_SECRET_KEY')
+
+# A helper function to create a safe filename
+def sanitize_filename(name):
+    # Remove invalid characters
+    return re.sub(r'[\/:*?"<>|]', "", name)
 
 @app.route('/convert', methods=['POST'])
 def convert_video():
@@ -23,50 +26,53 @@ def convert_video():
     if not url:
         return jsonify({"error": "URL is required"}), 400
 
+    temp_filename_base = ""
+    full_mp3_path = ""
+    
     try:
-        yt = YouTube(url)
+        # --- yt-dlp OPTIONS ---
+        # 1. First, just get the video info without downloading
+        info_opts = {'quiet': True}
+        with yt_dlp.YoutubeDL(info_opts) as ydl:
+            info = ydl.extract_info(url, download=False)
+            video_title = info.get('title', 'download')
+            temp_filename_base = sanitize_filename(video_title)
+            full_mp3_path = f"{temp_filename_base}.mp3"
 
-        # --- IMPROVED STREAM SELECTION ---
-        # First, try to get a specific audio-only stream which is often more reliable
-        video_stream = yt.streams.get_audio_only()
-        
-        # If the preferred stream isn't found, fall back to the old method
-        if video_stream is None:
-            video_stream = yt.streams.filter(only_audio=True).first()
+        # 2. Now, configure for MP3 download
+        ydl_opts = {
+            'format': 'bestaudio/best',
+            'postprocessors': [{
+                'key': 'FFmpegExtractAudio',
+                'preferredcodec': 'mp3',
+                'preferredquality': '192',
+            }],
+            'outtmpl': temp_filename_base, # yt-dlp will add .mp3
+            'quiet': True,
+        }
 
-        # If there's still no stream, the video is likely unavailable
-        if video_stream is None:
-            raise PytubeError("No suitable audio stream found for this video.")
+        # 3. Download and convert the file
+        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+            ydl.download([url])
 
-        buffer = io.BytesIO()
-        video_stream.stream_to_buffer(buffer)
-        buffer.seek(0)
-        
-        temp_input_filename = "temp_audio_input"
-        with open(temp_input_filename, "wb") as f:
-            f.write(buffer.read())
+        # 4. Check if the file was created
+        if not os.path.exists(full_mp3_path):
+            raise FileNotFoundError("Conversion failed, MP3 file not found.")
 
-        audio_clip = AudioFileClip(temp_input_filename)
-        mp3_buffer = io.BytesIO()
-        audio_clip.write_audiofile(mp3_buffer, codec='libmp3lame')
-        mp3_buffer.seek(0)
-        audio_clip.close()
-        os.remove(temp_input_filename)
-
-        safe_title = "".join([c for c in yt.title if c.isalpha() or c.isdigit() or c.isspace()]).rstrip()
-        mp3_filename = f"{safe_title}.mp3"
-
+        # 5. Send the file back to the user
         return send_file(
-            mp3_buffer,
+            full_mp3_path,
             as_attachment=True,
-            download_name=mp3_filename,
+            download_name=full_mp3_path,
             mimetype='audio/mpeg'
         )
-    
-    # --- IMPROVED ERROR HANDLING ---
-    except PytubeError as e:
-        print(f"Pytube error for URL {url}: {str(e)}")
-        return jsonify({"error": f"Video unavailable: It might be private, age-restricted, or removed."}), 500
+
     except Exception as e:
-        print(f"Generic error for URL {url}: {str(e)}")
-        return jsonify({"error": f"An unexpected error occurred during conversion."}), 500
+        print(f"yt-dlp error for URL {url}: {str(e)}")
+        # Send a generic but helpful error
+        return jsonify({"error": "Failed to convert video. It may be unavailable or protected."}), 500
+    
+    finally:
+        # 6. VERY IMPORTANT: Clean up the server by deleting the file
+        if os.path.exists(full_mp3_path):
+            os.remove(full_mp3_path)
